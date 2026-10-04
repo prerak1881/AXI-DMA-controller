@@ -1,0 +1,429 @@
+module data_mover_block(axi_interface axi_if,
+input bit ACLK,APRESETn,
+input logic cmd_valid,
+input logic[10:0]cmd_bytes,
+input logic [31:0] cmd_addr,
+input logic[25:0]total_bytes,
+output logic cmd_ready,burst_done,
+axi_stream_interface axis_if
+);
+logic [31:0] fifo [255:0];//32 bit data fifo of 256 depth
+logic [7:0]rd_ptr,wr_ptr;
+logic[8:0]count_fifo;
+logic fifo_wr_en,fifo_rd_en,fifo_full,fifo_empty,memory_burst_done;
+logic[25:0] byte_count;
+typedef enum{S0_idle,S1_address_phase,S2_data_phase}states_t;
+states_t next_state,state;
+//continuous assignment for stream_interface
+assign fifo_empty=(count_fifo==9'd0);
+assign fifo_full=(count_fifo==9'd256);
+assign axis_if.TVALID=(fifo_empty!=1'b1);
+assign axis_if.TDATA=fifo[rd_ptr];
+assign fifo_wr_en=(axi_if.RREADY && axi_if.RVALID && !(fifo_full));
+assign fifo_rd_en=(axis_if.TVALID && axis_if.TREADY && !(fifo_empty));
+always_comb begin
+axis_if.TLAST=1'b0;
+axis_if.TKEEP=4'b1111;
+if( total_bytes-byte_count<26'd4)begin
+if(axis_if.TVALID)begin
+axis_if.TLAST=1'b1;
+end
+case(total_bytes[1:0])
+2'd0:axis_if.TKEEP=4'b1111;
+2'd3:axis_if.TKEEP=4'b0111;
+2'd2:axis_if.TKEEP=4'b0011;
+2'd1:axis_if.TKEEP=4'b0001;
+default:axis_if.TKEEP=4'b1111;
+endcase
+end
+end
+always_ff @(posedge ACLK or negedge APRESETn)begin
+if(!APRESETn)
+state<=S0_idle;
+else begin
+state<=next_state;
+end
+end
+
+always_ff @(posedge ACLK or negedge APRESETn)begin
+if(!APRESETn)begin
+foreach(fifo[i])begin
+fifo[i]<=32'b0;
+end
+{rd_ptr,wr_ptr}<=8'b0;
+count_fifo<=9'b0;
+byte_count<=26'd0;
+cmd_ready<=1'b1;
+axi_if.ARADDR<=32'b0;
+axi_if.ARLEN<=8'b0;
+axi_if.ARSIZE<=3'b010;
+axi_if.ARVALID<=1'b0;
+axi_if.RREADY<=1'b0;
+memory_burst_done<=1'b0;
+end
+
+else
+case(state)
+S0_idle:begin
+cmd_ready<=1'b1;
+// Defaults every cycle
+axi_if.ARVALID <= 1'b0;
+axi_if.ARADDR  <= 32'd0;
+axi_if.ARLEN   <= 8'd0;
+axi_if.ARSIZE  <= 3'b010;
+if(cmd_valid)begin
+axi_if.ARADDR<=cmd_addr;
+$display("[%0t] cmd_valid=%b cmd_bytes=%b cmd_addr=%h",$time, cmd_valid, cmd_bytes, cmd_addr);
+axi_if.ARLEN<=((cmd_bytes+3)/4)-1;//there was a bug in this logic.
+axi_if.ARSIZE<=3'b010;
+axi_if.ARVALID<=1'b1;
+memory_burst_done<=1'b0;
+end
+end
+S1_address_phase:begin
+cmd_ready<=1'b0;
+if(axi_if.ARVALID && axi_if.ARREADY)
+axi_if.ARVALID<=1'b0;
+end
+S2_data_phase:begin
+axi_if.RREADY<=!fifo_full;
+$display("[%0t] DUT sees TVALID=%0b TREADY=%0b fifo_empty=%0b fifo_rd_en=%0b count=%0d",$time,axis_if.TVALID,axis_if.TREADY,fifo_empty,fifo_rd_en,count_fifo);
+if(axi_if.RLAST && fifo_wr_en)begin
+memory_burst_done<=1'b1;
+end
+if(fifo_wr_en)begin
+fifo[wr_ptr]<=axi_if.RDATA;
+wr_ptr<=wr_ptr+1;
+end
+if(fifo_rd_en)begin
+$display("[%0t] fifo_rd_en byte_count=%0d total=%0d fifo_count=%0d TLAST=%0b",$time,byte_count,total_bytes,count_fifo,axis_if.TLAST);
+rd_ptr<=rd_ptr+1;
+byte_count<=byte_count+26'd4;
+$display("The remaining num of bytes=%d and TVALID is=%b",byte_count,axis_if.TVALID);
+end
+if(fifo_rd_en && !fifo_wr_en)begin
+count_fifo<=count_fifo-1;
+end
+else if (fifo_wr_en && !fifo_rd_en)begin
+count_fifo<=count_fifo+1;
+end
+else
+count_fifo<=count_fifo;
+end
+endcase
+end
+//next state conditions 
+always_comb begin
+next_state=state;
+burst_done=1'b0;
+case(state)
+S0_idle:begin
+if(cmd_valid && cmd_ready)
+next_state=S1_address_phase;
+else
+next_state=S0_idle;
+end
+S1_address_phase:begin
+if(axi_if.ARREADY)
+next_state=S2_data_phase;
+else
+next_state=S1_address_phase;
+end
+S2_data_phase:begin
+if(memory_burst_done && fifo_empty )begin
+burst_done=1'b1;
+next_state=S0_idle;
+end
+else 
+next_state=S2_data_phase;
+end
+endcase
+end
+endmodule
+//control_logic is complete and correct .
+//----------------------------------------------------------------------------------------------------------------------
+module control_logic_fsm(register reg_if,
+input bit ACLK,APRESETn,
+output logic cmd_valid,
+output logic [10:0]cmd_bytes,
+input logic cmd_ready, burst_done,
+output logic[31:0]cmd_addr,
+output logic[25:0]total_bytes
+);
+logic[31:0]current_addr,next_4kb_boundary;//,cmd_addr;// deeclaring variables reuired in the fsm logic
+
+logic [10:0]calculated_burst_bytes;
+logic [25:0]remaining_bytes;
+typedef enum logic [2:0]{S0_idle,S1_calculate,S2_issue_cmd,S3_wait_for_burst,S4_generating_interrupt}states_t;
+states_t state, next_state;// state variables decalration for the fsm logic.
+
+always_ff @(posedge ACLK or negedge APRESETn)begin// present state assignement sequential block
+if(!APRESETn)begin
+state<=S0_idle;
+end
+else 
+state<=next_state;
+end
+
+always_ff @(posedge ACLK or negedge APRESETn)begin
+if(!APRESETn)begin
+reg_if.MM2S_DMASR[1]<=1'b1;//
+remaining_bytes<=26'd0;//
+calculated_burst_bytes<=11'd0;//
+current_addr<=32'd0;//
+next_4kb_boundary<=32'd0;//
+cmd_valid<=1'b0;//
+cmd_bytes<=11'd0;//
+total_bytes<=26'd0;//
+reg_if.MM2S_DMASR[12]<=1'b0;
+cmd_addr<=32'b0;
+end
+
+else
+case(state)
+S0_idle:begin
+reg_if.MM2S_DMASR[12]<=1'b0;
+if(reg_if.MM2S_DMACR[0]==1'b1)begin
+reg_if.MM2S_DMASR[1]<=1'b0;
+current_addr<=reg_if.MM2S_SA;
+remaining_bytes<=reg_if.MM2S_LENGTH;
+total_bytes<=reg_if.MM2S_LENGTH;
+next_4kb_boundary<=(((reg_if.MM2S_SA)& 32'hfffff000)+32'h00001000);
+end
+else 
+reg_if.MM2S_DMASR[1]<=1'b1;
+end
+S1_calculate:begin
+calculated_burst_bytes<=(26'd1024<remaining_bytes)?((26'd1024<(next_4kb_boundary-current_addr))?11'd1024:(next_4kb_boundary-current_addr)):((remaining_bytes<(next_4kb_boundary-current_addr))?remaining_bytes:(next_4kb_boundary-current_addr));
+end
+S2_issue_cmd:begin
+cmd_valid<=1'b1;
+cmd_bytes<=calculated_burst_bytes;
+cmd_addr<=current_addr;
+end
+S3_wait_for_burst:begin
+cmd_valid<=1'b0;
+if(burst_done)begin
+current_addr<=current_addr+calculated_burst_bytes;
+remaining_bytes<=remaining_bytes-calculated_burst_bytes;
+next_4kb_boundary<=(((current_addr+calculated_burst_bytes)& 32'hfffff000)+32'h00001000);
+end
+end
+S4_generating_interrupt:begin
+reg_if.MM2S_DMASR[12]<=1'b1;
+end
+endcase
+end
+
+always_comb begin// next state assignment procedural block
+next_state=state;
+case(state)
+S0_idle:begin
+if (reg_if.MM2S_DMACR[0]==1'b1)
+next_state=S1_calculate;
+else
+next_state=S0_idle;
+end
+S1_calculate:begin
+next_state=S2_issue_cmd;
+end
+S2_issue_cmd:begin
+if(cmd_ready && cmd_valid)
+next_state=S3_wait_for_burst;
+else
+next_state=S2_issue_cmd;
+end
+S3_wait_for_burst:begin
+if(burst_done)
+if(remaining_bytes<=calculated_burst_bytes)
+next_state=S4_generating_interrupt;
+else 
+next_state=S1_calculate;
+else
+next_state=S3_wait_for_burst;
+end
+S4_generating_interrupt:begin
+next_state=S0_idle;
+end
+endcase
+end
+endmodule
+//-------------------------------------------------------------------------------------------------------------------
+//top module connected to the cpu throught the axi_lite interface.
+module top(register reg_if,
+axi_lite_interface axil_if,
+input bit ACLK,APRESETn,
+axi_stream_interface axis_if,
+axi_interface axi_if
+);
+localparam ADDR_WIDTH=32;
+localparam DATA_WIDTH=32;
+localparam MM2S_DMACR=8'h00;
+localparam MM2S_DMASR=8'h04;
+localparam MM2S_SA=8'h18;
+localparam MM2S_LENGTH=8'h28;
+wire cmd_valid,cmd_ready,burst_done;//for data mover block
+wire[10:0]cmd_bytes;
+wire[25:0]total_bytes;
+wire[31:0]cmd_addr;
+data_mover_block d_m_b(.axi_if(axi_if),
+.ACLK(ACLK),
+.APRESETn(APRESETn),
+.axis_if(axis_if),
+.cmd_valid(cmd_valid),
+.cmd_bytes(cmd_bytes),
+.cmd_addr(cmd_addr),
+.total_bytes(total_bytes),
+.cmd_ready(cmd_ready),
+.burst_done(burst_done)
+);// complete the module definitions.
+control_logic_fsm ctrl_log(
+.ACLK(ACLK),
+.reg_if(reg_if),
+.APRESETn(APRESETn),
+.cmd_valid(cmd_valid),
+.cmd_bytes(cmd_bytes),
+.cmd_addr(cmd_addr),
+.total_bytes(total_bytes),
+.cmd_ready(cmd_ready),
+.burst_done(burst_done));// same complete the module definitions.
+typedef enum logic [1:0] {WR_IDLE,WR_RESPONSE} wr_state_t;
+wr_state_t wr_state, wr_next_state;
+logic aw_received;
+logic w_received;
+logic [ADDR_WIDTH-1:0] wr_addr;
+logic [DATA_WIDTH-1:0] wr_data;
+//states_wr_t state_wr,next_state_wr;
+typedef enum logic [1:0]{S0_idle_rd,S1_read_address,S2_read_data}states_rd_t;
+states_rd_t state_rd,next_state_rd;
+logic[ADDR_WIDTH-1:0]addr_rd;
+//fsm for write transafer
+// next state assignment sequential block
+always_ff @(posedge ACLK or negedge APRESETn) begin
+if(!APRESETn)
+wr_state<=WR_IDLE;
+else
+wr_state<=wr_next_state;
+end
+//fsm working sequential block
+always_ff @(posedge ACLK or negedge APRESETn) begin
+if(!APRESETn) begin
+axil_if.AWREADY <= 1'b0;
+axil_if.WREADY  <= 1'b0;
+axil_if.BVALID  <= 1'b0;
+axil_if.BRESP   <= 2'b00;
+aw_received <= 1'b0;
+w_received  <= 1'b0;
+wr_addr<='0;
+wr_data<='0;
+end
+else begin
+case(wr_state)
+WR_IDLE: begin
+axil_if.AWREADY <= !aw_received;
+axil_if.WREADY  <= !w_received;
+axil_if.BVALID  <= '0;
+if(axil_if.AWVALID) begin
+wr_addr <= axil_if.AWADDR;
+aw_received <= 1;
+end
+if(axil_if.WVALID) begin
+wr_data <= axil_if.WDATA;
+w_received <= 1;
+end
+end
+WR_RESPONSE: begin
+if(aw_received && w_received)begin
+case(wr_addr[7:0])
+MM2S_DMACR:reg_if.MM2S_DMACR<=wr_data;
+MM2S_SA:reg_if.MM2S_SA<=wr_data;
+MM2S_LENGTH:reg_if.MM2S_LENGTH<=wr_data;
+endcase
+$display("MM2S_SA = %h", reg_if.MM2S_SA);
+$display("MM2S_LENGTH = %h", reg_if.MM2S_LENGTH);
+end
+axil_if.AWREADY<=1'b0;
+axil_if.WREADY<=1'b0;
+axil_if.BVALID <= 1'b1;
+axil_if.BRESP  <= 2'b00;
+if( axil_if.BREADY) begin
+aw_received <= 0;
+w_received  <= 0;
+end
+end
+endcase
+end
+end
+//next_state assignment
+always_comb begin
+wr_next_state = wr_state;
+case(wr_state)
+WR_IDLE: begin
+if(aw_received && w_received)
+wr_next_state = WR_RESPONSE;
+else wr_next_state=WR_IDLE;
+end
+WR_RESPONSE: begin
+if(axil_if.BREADY && axil_if.BVALID)
+wr_next_state = WR_IDLE;
+end
+default:wr_next_state = WR_IDLE;
+endcase
+end
+//fsm for read transfer
+// state assignment sequential block
+always_ff@(posedge ACLK or negedge APRESETn)begin
+if(!APRESETn)
+state_rd<=S0_idle_rd;
+else
+state_rd<=next_state_rd;
+end
+//fsm working sequential block
+always_ff @(posedge ACLK or negedge APRESETn)begin
+if(!APRESETn)begin
+axil_if.ARREADY<=1'b0;
+axil_if.RVALID<=1'b0;
+axil_if.RRESP<=2'b00;
+end
+else begin
+case(state_rd)
+S0_idle_rd:begin
+axil_if.ARREADY<=1'b1;
+axil_if.RVALID<=1'b0;
+axil_if.RRESP<=2'b00;
+if(axil_if.ARVALID)begin
+case(axil_if.ARADDR[7:0])
+MM2S_DMACR:axil_if.RDATA<=reg_if.MM2S_DMACR;
+MM2S_LENGTH:axil_if.RDATA<=reg_if.MM2S_LENGTH;
+MM2S_SA:axil_if.RDATA<=reg_if.MM2S_SA;
+MM2S_DMASR:axil_if.RDATA<=reg_if.MM2S_DMASR;
+endcase
+axil_if.RVALID<=1'b1;
+axil_if.ARREADY<=1'b0;
+axil_if.RRESP<=2'b00;
+end
+end
+S2_read_data:begin
+if(axil_if.RREADY )begin
+axil_if.RVALID<=1'b0;
+end
+end
+endcase
+end
+end
+//next state assignment combinational block
+always_comb begin
+next_state_rd=state_rd;
+case(state_rd)
+S0_idle_rd:
+if(axil_if.ARVALID && axil_if.ARREADY)
+next_state_rd=S2_read_data;
+else next_state_rd=S0_idle_rd;
+S2_read_data:if(axil_if.RVALID && axil_if.RREADY)
+next_state_rd=S0_idle_rd;
+else 
+next_state_rd=S2_read_data;
+endcase
+end
+endmodule
+

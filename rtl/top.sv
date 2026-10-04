@@ -1,3 +1,66 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 10.07.2026 15:12:05
+// Design Name: 
+// Module Name: top
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+//AXI_stream interfacce
+/*interface axi_stream_interface(input bit ACCLK,ARESETn);
+logic TVALID,TREADY,TLAST;
+logic [31:0]TDATA;
+logic [3:0]TKEEP;
+endinterface
+//----------------------------------------------------------------------------------
+interface axi_interface(input bit ACLK,ARESETn);// the DMA controller works as a read master for the memory 
+logic [31:0]ARADDR;
+logic ARVALID;// output Address read transfer signals
+logic [7:0]ARLEN;
+logic [2:0]ARSIZE;
+logic ARREADY;// input address read transfer signals
+logic [31:0]RDATA;
+logic RLAST,RVALID;// input read transfer signals
+logic RREADY;//output read transfer signals
+endinterface
+//-----------------------------------------------------------------
+//axi-lite interface
+interface axi_lite_interface(input bit ACLK,ARESETn);// the DMA controller works as a slave wirte for the CPU(write master)
+logic [31:0]AWADDR;
+logic AWREADY,AWVALID;
+logic WREADY,WVALID;
+logic [31:0]WDATA;
+logic RVALID,RREADY;
+logic [31:0]RDATA;
+logic [1:0]RRESP;
+logic ARVALID,ARREADY;
+logic[31:0]ARADDR;
+logic BVALID,BREADY;
+logic [1:0]BRESP;
+endinterface
+//-----------------------------------------------------------------
+// register interface.
+interface register;
+logic [31:0] MM2S_DMACR,MM2S_DMASR,MM2S_SA,MM2S_LENGTH;
+modport c_fsm(output MM2S_DMASR,
+input MM2S_DMACR,MM2S_LENGTH,MM2S_SA);
+modport top(output MM2S_DMACR,MM2S_SA,MM2S_LENGTH,
+input MM2S_DMASR );
+endinterface*/
+//-----------------------------------------------------------------
+//data mover block connected to memory controller through axi_interface and connected to ethernet or PCIe through axi_stream interface.
 module data_mover_block(axi_interface axi_if,
 input bit ACLK,APRESETn,
 input logic cmd_valid,
@@ -67,13 +130,14 @@ case(state)
 S0_idle:begin
 cmd_ready<=1'b1;
 // Defaults every cycle
-axi_if.ARVALID <= 1'b0;
-axi_if.ARADDR  <= 32'd0;
-axi_if.ARLEN   <= 8'd0;
-axi_if.ARSIZE  <= 3'b010;
+    axi_if.ARVALID <= 1'b0;
+    axi_if.ARADDR  <= 32'd0;
+    axi_if.ARLEN   <= 8'd0;
+    axi_if.ARSIZE  <= 3'b010;
 if(cmd_valid)begin
 axi_if.ARADDR<=cmd_addr;
-$display("[%0t] cmd_valid=%b cmd_bytes=%b cmd_addr=%h",$time, cmd_valid, cmd_bytes, cmd_addr);
+$display("[%0t] cmd_valid=%b cmd_bytes=%b cmd_addr=%h",
+         $time, cmd_valid, cmd_bytes, cmd_addr);
 axi_if.ARLEN<=((cmd_bytes+3)/4)-1;//there was a bug in this logic.
 axi_if.ARSIZE<=3'b010;
 axi_if.ARVALID<=1'b1;
@@ -87,7 +151,13 @@ axi_if.ARVALID<=1'b0;
 end
 S2_data_phase:begin
 axi_if.RREADY<=!fifo_full;
-$display("[%0t] DUT sees TVALID=%0b TREADY=%0b fifo_empty=%0b fifo_rd_en=%0b count=%0d",$time,axis_if.TVALID,axis_if.TREADY,fifo_empty,fifo_rd_en,count_fifo);
+$display("[%0t] DUT sees TVALID=%0b TREADY=%0b fifo_empty=%0b fifo_rd_en=%0b count=%0d",
+         $time,
+         axis_if.TVALID,
+         axis_if.TREADY,
+         fifo_empty,
+         fifo_rd_en,
+         count_fifo);
 if(axi_if.RLAST && fifo_wr_en)begin
 memory_burst_done<=1'b1;
 end
@@ -96,7 +166,13 @@ fifo[wr_ptr]<=axi_if.RDATA;
 wr_ptr<=wr_ptr+1;
 end
 if(fifo_rd_en)begin
-$display("[%0t] fifo_rd_en byte_count=%0d total=%0d fifo_count=%0d TLAST=%0b",$time,byte_count,total_bytes,count_fifo,axis_if.TLAST);
+$display("[%0t] fifo_rd_en byte_count=%0d total=%0d fifo_count=%0d TLAST=%0b",
+             $time,
+             byte_count,
+             total_bytes,
+             count_fifo,
+             axis_if.TLAST);
+
 rd_ptr<=rd_ptr+1;
 byte_count<=byte_count+26'd4;
 $display("The remaining num of bytes=%d and TVALID is=%b",byte_count,axis_if.TVALID);
